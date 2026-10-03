@@ -3,7 +3,7 @@
 // @namespace    https://tampermonkey.net/
 // @version      6.0
 // @description  Shows active prior liability and rated driver DOBs in a movable box
-// @match        *://*/*
+// @match        https://alta.farmers.com/*
 // @grant        none
 // ==/UserScript==
 
