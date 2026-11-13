@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Alta Prior Liability + Rated Drivers
 // @namespace    https://tampermonkey.net/
-// @version      6.0
-// @description  Shows active prior liability and rated driver DOBs in a movable box
+// @version      6.1
+// @description  Compact Alta-only panel showing active carrier, BI/PD, rated drivers, marital status and PNI swap alert
 // @match        https://alta.farmers.com/*
 // @grant        none
 // ==/UserScript==
@@ -14,11 +14,13 @@
     const BOX_ID = 'alta-prior-liability-box';
 
     let currentCustomer = '';
+    let currentCarrier = '';
     let currentBI = '';
     let currentPD = '';
     let currentDrivers = [];
 
     let lastCustomer = '';
+    let lastCarrier = '';
     let lastBI = '';
     let lastPD = '';
     let lastDriversJSON = '';
@@ -108,28 +110,40 @@
         return null;
     }
 
-    function findLiability() {
-        const card = findActivePolicyCard();
+   
+function findLiability() {
+    const card = findActivePolicyCard();
 
-        if (!card) return { bi: '', pd: '' };
-
-        const text = normalizeText(
-            card.innerText || card.textContent || ''
-        );
-
-        const biMatch = text.match(
-            /\bBI\b[\s:]*\$?\s*([\d,]+)\s*\/\s*\$?\s*([\d,]+)/i
-        );
-
-        const pdMatch = text.match(
-            /\bPD\b[\s:]*\$?\s*([\d,]+)/i
-        );
-
+    if (!card) {
         return {
-            bi: biMatch ? `$${biMatch[1]} / $${biMatch[2]}` : '',
-            pd: pdMatch ? `$${pdMatch[1]}` : ''
+            carrier: '',
+            bi: '',
+            pd: ''
         };
     }
+
+    const text = normalizeText(
+        card.innerText || card.textContent || ''
+    );
+
+    const carrierMatch = text.match(
+        /^(.+?)\s+In Effect\b/i
+    );
+
+    const biMatch = text.match(
+        /\bBI\b[\s:]*\$?\s*([\d,]+)\s*\/\s*\$?\s*([\d,]+)/i
+    );
+
+    const pdMatch = text.match(
+        /\bPD\b[\s:]*\$?\s*([\d,]+)/i
+    );
+
+    return {
+        carrier: carrierMatch ? carrierMatch[1].trim() : '',
+        bi: biMatch ? `$${biMatch[1]} / $${biMatch[2]}` : '',
+        pd: pdMatch ? `$${pdMatch[1]}` : ''
+    };
+}
 
     function findRatedDriversSection() {
         const elements = Array.from(document.querySelectorAll('body *'));
@@ -161,80 +175,109 @@
         return null;
     }
 
-    function findRatedDrivers() {
-        const section = findRatedDriversSection();
-        if (!section) return [];
+    
+function findRatedDrivers() {
+    const section = findRatedDriversSection();
+    if (!section) return [];
 
-        let container = section.parentElement;
-        if (!container) return [];
+    const container = section.parentElement;
+    if (!container) return [];
 
-        const inputs = Array.from(container.querySelectorAll('input'))
-            .filter(isVisible)
-            .filter(input => {
-                const type = (input.type || '').toLowerCase();
-                return type !== 'hidden' &&
-                       type !== 'checkbox' &&
-                       type !== 'radio';
-            });
+    // Read visible inputs AND dropdowns.
+    const inputs = Array.from(
+        container.querySelectorAll('input, select')
+    )
+        .filter(isVisible)
+        .filter(input => {
+            const type = (input.type || '').toLowerCase();
+            return type !== 'hidden' &&
+                   type !== 'checkbox' &&
+                   type !== 'radio';
+        });
 
-        if (!inputs.length) return [];
+    if (!inputs.length) return [];
 
-        const columns = [];
+    const columns = [];
 
-        for (const input of inputs) {
-            const rect = input.getBoundingClientRect();
-            const x = Math.round(rect.left / 25) * 25;
+    for (const input of inputs) {
+        const rect = input.getBoundingClientRect();
+        const x = Math.round(rect.left / 25) * 25;
 
-            let column = columns.find(c => Math.abs(c.x - x) <= 25);
+        let column = columns.find(c => Math.abs(c.x - x) <= 25);
 
-            if (!column) {
-                column = { x, inputs: [] };
-                columns.push(column);
-            }
-
-            column.inputs.push({
-                element: input,
-                top: rect.top
-            });
+        if (!column) {
+            column = { x, inputs: [] };
+            columns.push(column);
         }
 
-        columns.sort((a, b) => a.x - b.x);
-
-        const drivers = [];
-
-        for (const column of columns) {
-            column.inputs.sort((a, b) => a.top - b.top);
-
-            if (column.inputs.length < 3) continue;
-
-            const firstThree = column.inputs.slice(0, 3).map(x => x.element);
-
-            const firstName = normalizeText(firstThree[0].value);
-            const lastName = normalizeText(firstThree[1].value);
-            const dob = normalizeText(firstThree[2].value);
-
-            if (!firstName || !lastName || !dob) continue;
-            if (firstName.length > 50 || lastName.length > 50) continue;
-            if (!/\d/.test(dob)) continue;
-
-            drivers.push({ firstName, lastName, dob });
-        }
-
-        const unique = [];
-        const seen = new Set();
-
-        for (const driver of drivers) {
-            const key = normalizeName(
-                `${driver.firstName} ${driver.lastName} ${driver.dob}`
-            );
-
-            if (seen.has(key)) continue;
-            seen.add(key);
-            unique.push(driver);
-        }
-
-        return unique;
+        column.inputs.push({
+            element: input,
+            top: rect.top
+        });
     }
+
+    const drivers = [];
+
+    for (const column of columns) {
+        column.inputs.sort((a, b) => a.top - b.top);
+
+        const fields = column.inputs.map(item => item.element);
+
+        if (fields.length < 3) continue;
+
+        const firstName = normalizeText(fields[0].value);
+        const lastName = normalizeText(fields[1].value);
+        const dob = normalizeText(fields[2].value);
+
+        if (!firstName || !lastName || !dob) continue;
+        if (firstName.length > 50 || lastName.length > 50) continue;
+        if (!/\d/.test(dob)) continue;
+
+        // Dropdowns are ordered by their vertical position.
+        const selects = fields.filter(
+            field => field.tagName === 'SELECT'
+        );
+
+        function selectedValue(select) {
+            if (!select) return '';
+
+            return normalizeText(
+                select.selectedOptions?.[0]?.textContent ||
+                select.value
+            );
+        }
+
+        // Driver status and Gender come before Relationship to PNI
+        // and Marital Status on the Alta driver form.
+        const relationship = selectedValue(selects[2]);
+        const maritalStatus = selectedValue(selects[3]);
+
+        drivers.push({
+            firstName,
+            lastName,
+            dob,
+            relationship,
+            maritalStatus
+        });
+    }
+
+    // Remove duplicate driver records.
+    const unique = [];
+    const seen = new Set();
+
+    for (const driver of drivers) {
+        const key = normalizeName(
+            `${driver.firstName} ${driver.lastName} ${driver.dob}`
+        );
+
+        if (seen.has(key)) continue;
+
+        seen.add(key);
+        unique.push(driver);
+    }
+
+    return unique;
+}
 
     function escapeHTML(value) {
         return String(value)
@@ -262,6 +305,7 @@
 
             <div id="alta-liability-content">
                 <div id="alta-customer">Customer: Detecting...</div>
+                <div id="alta-carrier">Carrier: --</div>
 
                 <div id="alta-policy-section">
                     <div class="alta-value">
@@ -275,6 +319,7 @@
                     </div>
                 </div>
 
+                <div id="alta-pni-alert" style="display:none;">DO SWAP PNI</div>
                 <div id="alta-drivers-title">RATED DRIVERS</div>
                 <div id="alta-drivers">Waiting for rated drivers...</div>
                 <div id="alta-status">Waiting...</div>
@@ -290,14 +335,14 @@
             #${BOX_ID} {
                 position: fixed;
                 top: 90px;
-                right: 20px;
-                width: 310px;
-                max-height: 80vh;
+                right: 18px;
+                width: 350px;
+                max-width: calc(100vw - 24px);
                 background: #fff;
                 color: #222;
-                border: 2px solid #16852b;
-                border-radius: 9px;
-                box-shadow: 0 4px 18px rgba(0,0,0,.28);
+                border: 1px solid #16852b;
+                border-radius: 8px;
+                box-shadow: 0 3px 14px rgba(0,0,0,.22);
                 z-index: 2147483647;
                 font-family: Arial, Helvetica, sans-serif;
                 overflow: hidden;
@@ -305,14 +350,14 @@
             }
 
             #alta-liability-header {
-                height: 34px;
+                height: 28px;
                 background: #16852b;
                 color: #fff;
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                padding: 0 8px;
-                font-size: 12px;
+                padding: 0 7px;
+                font-size: 11px;
                 font-weight: bold;
                 cursor: grab;
                 touch-action: none;
@@ -321,12 +366,12 @@
             #alta-liability-header:active { cursor: grabbing; }
 
             #alta-liability-header button {
-                width: 22px;
-                height: 25px;
+                width: 20px;
+                height: 23px;
                 border: none;
                 background: transparent;
                 color: #fff;
-                font-size: 18px;
+                font-size: 16px;
                 font-weight: bold;
                 cursor: pointer;
                 padding: 0;
@@ -338,59 +383,103 @@
             }
 
             #alta-liability-content {
-                padding: 12px;
-                max-height: calc(80vh - 34px);
+                padding: 8px;
+                max-height: 230px;
                 overflow-y: auto;
             }
 
             #alta-customer {
-                font-size: 12px;
+                font-size: 10px;
                 font-weight: bold;
                 color: #555;
-                margin-bottom: 12px;
+                margin-bottom: 3px;
                 white-space: nowrap;
                 overflow: hidden;
                 text-overflow: ellipsis;
             }
 
+            #alta-carrier {
+                font-size: 10px;
+                font-weight: bold;
+                color: #333;
+                margin-bottom: 6px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            #alta-policy-section {
+                display: flex;
+                align-items: center;
+                gap: 14px;
+                padding: 5px 0;
+                border-top: 1px solid #e5e5e5;
+                border-bottom: 1px solid #e5e5e5;
+            }
+
             .alta-value {
                 display: flex;
                 align-items: center;
-                gap: 6px;
-                font-size: 16px;
-                margin-bottom: 8px;
+                gap: 4px;
+                font-size: 11px;
+                margin: 0;
+                white-space: nowrap;
             }
 
-            .alta-value span { width: 28px; }
+            .alta-value span { color: #555; }
             .alta-value strong { font-weight: bold; }
 
+            #alta-pni-alert {
+                margin-top: 6px;
+                padding: 4px 6px;
+                background: #fff0d6;
+                border: 1px solid #e2a13b;
+                border-radius: 4px;
+                color: #8a4b00;
+                font-size: 10px;
+                font-weight: bold;
+                text-align: center;
+            }
+
             #alta-drivers-title {
-                border-top: 1px solid #ddd;
-                margin-top: 12px;
-                padding-top: 10px;
-                font-size: 11px;
+                margin-top: 7px;
+                margin-bottom: 4px;
+                font-size: 9px;
                 font-weight: bold;
                 color: #555;
             }
 
+            #alta-drivers {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 5px;
+            }
+
             .alta-driver {
-                padding: 8px 0;
-                border-bottom: 1px solid #eee;
-                font-size: 12px;
+                min-width: 0;
+                padding: 5px;
+                background: #f5f7f8;
+                border: 1px solid #e5e8ea;
+                border-radius: 4px;
+                font-size: 10px;
+                overflow-wrap: anywhere;
             }
 
             .alta-driver-name {
                 font-weight: bold;
-                margin-bottom: 4px;
+                margin-bottom: 3px;
             }
 
-            .alta-driver-dob { color: #555; }
+            .alta-driver-detail {
+                color: #555;
+                line-height: 1.35;
+            }
 
             #alta-status {
-                margin-top: 10px;
-                padding-top: 8px;
-                border-top: 1px solid #ddd;
-                font-size: 10px;
+                margin-top: 6px;
+                padding-top: 5px;
+                border-top: 1px solid #e5e5e5;
+                font-size: 9px;
                 color: #666;
             }
         `;
@@ -475,45 +564,69 @@
         });
     }
 
+    function shouldSwapPNI(drivers) {
+        const isMarried = driver =>
+            /\bmarried\b/i.test(normalizeText(driver.maritalStatus));
+
+        const isSelf = driver =>
+            /^self$/i.test(normalizeText(driver.relationship));
+
+        const isSpouse = driver =>
+            /spouse|\bdp\b/i.test(normalizeText(driver.relationship));
+
+        return drivers.some(selfDriver =>
+            isSelf(selfDriver) &&
+            isMarried(selfDriver) &&
+            drivers.some(spouseDriver =>
+                spouseDriver !== selfDriver &&
+                isSpouse(spouseDriver) &&
+                isMarried(spouseDriver)
+            )
+        );
+    }
+
     function updateBox() {
         if (boxClosed) return;
 
         createBox();
 
         const customer = document.getElementById('alta-customer');
+        const carrier = document.getElementById('alta-carrier');
         const bi = document.getElementById('alta-bi');
         const pd = document.getElementById('alta-pd');
         const drivers = document.getElementById('alta-drivers');
         const status = document.getElementById('alta-status');
+        const pniAlert = document.getElementById('alta-pni-alert');
 
         if (!customer) return;
 
-        customer.textContent =
-            currentCustomer
-                ? `Customer: ${currentCustomer}`
-                : 'Customer: Detecting...';
+        customer.textContent = currentCustomer
+            ? `Customer: ${currentCustomer}`
+            : 'Customer: Detecting...';
 
+        carrier.textContent = `Carrier: ${currentCarrier || '--'}`;
         bi.textContent = currentBI || '--';
         pd.textContent = currentPD || '--';
 
         if (!currentDrivers.length) {
-            drivers.innerHTML = 'No rated drivers detected.';
+            drivers.innerHTML = '<div class="alta-driver">No rated drivers detected.</div>';
         } else {
             drivers.innerHTML = currentDrivers.map((driver, index) => `
                 <div class="alta-driver">
                     <div class="alta-driver-name">
-                        ${index + 1}. ${escapeHTML(driver.firstName)}
-                        ${escapeHTML(driver.lastName)}
+                        ${index + 1}. ${escapeHTML(driver.firstName)} ${escapeHTML(driver.lastName)}
                     </div>
-                    <div class="alta-driver-dob">
-                        DOB: ${escapeHTML(driver.dob)}
-                    </div>
+                    <div class="alta-driver-detail">DOB: ${escapeHTML(driver.dob)}</div>
+                    <div class="alta-driver-detail">PNI: ${escapeHTML(driver.relationship || '--')}</div>
+                    <div class="alta-driver-detail">Marital: ${escapeHTML(driver.maritalStatus || '--')}</div>
                 </div>
             `).join('');
         }
 
+        pniAlert.style.display = shouldSwapPNI(currentDrivers) ? 'block' : 'none';
+
         status.textContent =
-            (currentBI || currentPD || currentDrivers.length)
+            (currentCarrier || currentBI || currentPD || currentDrivers.length)
                 ? 'Information detected'
                 : 'Waiting for information...';
     }
@@ -529,11 +642,13 @@
                 normalizeName(detectedCustomer) !== normalizeName(currentCustomer)
             ) {
                 currentCustomer = detectedCustomer;
+                currentCarrier = '';
                 currentBI = '';
                 currentPD = '';
                 currentDrivers = [];
 
                 lastCustomer = '';
+                lastCarrier = '';
                 lastBI = '';
                 lastPD = '';
                 lastDriversJSON = '';
@@ -546,6 +661,7 @@
 
         const liability = findLiability();
 
+        if (liability.carrier) currentCarrier = liability.carrier;
         if (liability.bi) currentBI = liability.bi;
         if (liability.pd) currentPD = liability.pd;
 
@@ -559,6 +675,7 @@
 
         if (
             currentCustomer !== lastCustomer ||
+            currentCarrier !== lastCarrier ||
             currentBI !== lastBI ||
             currentPD !== lastPD ||
             driversJSON !== lastDriversJSON
@@ -566,6 +683,7 @@
             updateBox();
 
             lastCustomer = currentCustomer;
+            lastCarrier = currentCarrier;
             lastBI = currentBI;
             lastPD = currentPD;
             lastDriversJSON = driversJSON;
