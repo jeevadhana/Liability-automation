@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Alta Prior Liability + Rated Drivers
 // @namespace    https://tampermonkey.net/
-// @version      6.7
-// @description  Highlights carrier and makes BI/PD limits larger and easier to read
+// @version      6.8
+// @description  Shows customer name only; highlights carrier and larger BI/PD limits
 // @match        https://alta.farmers.com/*
 // @grant        none
 // ==/UserScript==
@@ -46,38 +46,39 @@
     }
 
     function findCustomerName() {
-        // The customer label is in Alta's left navigation, e.g.
-        // "Sylvia Lopez - Auto + Home". Do not depend on body.innerText
-        // line breaks: Alta may combine neighboring sidebar text into one line.
-        const pattern = /([\p{L}][\p{L}'’.-]+(?:\s+[\p{L}][\p{L}'’.-]+){1,3})\s*-\s*Auto(?:\s*\+\s*Home)?\b/i;
-        const candidates = Array.from(document.querySelectorAll(
+        // Read the visible customer label in Alta's left sidebar and return
+        // ONLY the person's name. The policy type suffix is never displayed.
+        const suffixPattern = /\s*-\s*Auto(?:\s*\+\s*Home)?\s*$/i;
+        const elements = Array.from(document.querySelectorAll(
             'a, button, span, p, div, li, h1, h2, h3'
-        )).filter(isVisible).map(element => ({
+        )).filter(isVisible);
+
+        const candidates = elements.map(element => ({
             element,
             text: normalizeText(element.innerText || element.textContent || '')
-        })).filter(item => item.text && item.text.length <= 120 && pattern.test(item.text));
+        })).filter(item => {
+            if (!item.text || item.text.length > 100) return false;
+            if (!suffixPattern.test(item.text)) return false;
+            const name = normalizeText(item.text.replace(suffixPattern, ''));
+            return /^[\p{L}][\p{L}'’.-]*(?:\s+[\p{L}][\p{L}'’.-]*){1,4}$/u.test(name);
+        });
 
-        // Prefer the smallest matching element so a whole navigation panel
-        // cannot accidentally be interpreted as the customer label.
+        // Choose the smallest visible element containing the full label.
         candidates.sort((a, b) => a.text.length - b.text.length);
-        for (const item of candidates) {
-            const match = item.text.match(pattern);
-            if (match) {
-                const name = normalizeText(match[1]);
-                if (name.split(/\s+/).length >= 2) return name;
-            }
+        if (candidates.length) {
+            return normalizeText(candidates[0].text.replace(suffixPattern, ''));
         }
 
-        // Fallback: inspect individual visible text nodes, including labels
-        // whose parent combines the customer name with other sidebar text.
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-        while (walker.nextNode()) {
-            const node = walker.currentNode;
-            if (!normalizeText(node.nodeValue)) continue;
-            const parent = node.parentElement;
-            if (!isVisible(parent)) continue;
-            const match = normalizeText(node.nodeValue).match(pattern);
-            if (match) return normalizeText(match[1]);
+        // Fallback for labels split between nested elements: inspect each
+        // visible element's text and extract only the name before the suffix.
+        for (const element of elements) {
+            const text = normalizeText(element.innerText || element.textContent || '');
+            const match = text.match(/^(.+?)\s*-\s*Auto(?:\s*\+\s*Home)?\s*$/i);
+            if (!match) continue;
+            const name = normalizeText(match[1]);
+            if (/^[\p{L}][\p{L}'’.-]*(?:\s+[\p{L}][\p{L}'’.-]*){1,4}$/u.test(name)) {
+                return name;
+            }
         }
         return null;
     }
