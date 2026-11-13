@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Alta Prior Liability + Rated Drivers
 // @namespace    https://tampermonkey.net/
-// @version      6.1
-// @description  Compact Alta-only panel showing active carrier, BI/PD, rated drivers, marital status and PNI swap alert
+// @version      6.7
+// @description  Highlights carrier and makes BI/PD limits larger and easier to read
 // @match        https://alta.farmers.com/*
 // @grant        none
 // ==/UserScript==
@@ -46,27 +46,39 @@
     }
 
     function findCustomerName() {
-        if (!document.body) return null;
+        // The customer label is in Alta's left navigation, e.g.
+        // "Sylvia Lopez - Auto + Home". Do not depend on body.innerText
+        // line breaks: Alta may combine neighboring sidebar text into one line.
+        const pattern = /([\p{L}][\p{L}'’.-]+(?:\s+[\p{L}][\p{L}'’.-]+){1,3})\s*-\s*Auto(?:\s*\+\s*Home)?\b/i;
+        const candidates = Array.from(document.querySelectorAll(
+            'a, button, span, p, div, li, h1, h2, h3'
+        )).filter(isVisible).map(element => ({
+            element,
+            text: normalizeText(element.innerText || element.textContent || '')
+        })).filter(item => item.text && item.text.length <= 120 && pattern.test(item.text));
 
-        const lines = (document.body.innerText || '')
-            .split('\n')
-            .map(normalizeText)
-            .filter(Boolean);
-
-        for (const line of lines) {
-            const match = line.match(/^(.+?)\s*-\s*Auto$/i);
-            if (!match) continue;
-
-            let name = normalizeText(match[1])
-                .replace(/^(circle|radio|button|select)\s+/i, '');
-
-            if (name.length >= 3 &&
-                name.length <= 100 &&
-                !/^(drivers|customer|prior insurance)$/i.test(name)) {
-                return name;
+        // Prefer the smallest matching element so a whole navigation panel
+        // cannot accidentally be interpreted as the customer label.
+        candidates.sort((a, b) => a.text.length - b.text.length);
+        for (const item of candidates) {
+            const match = item.text.match(pattern);
+            if (match) {
+                const name = normalizeText(match[1]);
+                if (name.split(/\s+/).length >= 2) return name;
             }
         }
 
+        // Fallback: inspect individual visible text nodes, including labels
+        // whose parent combines the customer name with other sidebar text.
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        while (walker.nextNode()) {
+            const node = walker.currentNode;
+            if (!normalizeText(node.nodeValue)) continue;
+            const parent = node.parentElement;
+            if (!isVisible(parent)) continue;
+            const match = normalizeText(node.nodeValue).match(pattern);
+            if (match) return normalizeText(match[1]);
+        }
         return null;
     }
 
@@ -122,13 +134,22 @@ function findLiability() {
         };
     }
 
-    const text = normalizeText(
+    const rawText = String(
         card.innerText || card.textContent || ''
     );
 
-    const carrierMatch = text.match(
-        /^(.+?)\s+In Effect\b/i
-    );
+    const text = normalizeText(rawText);
+
+    // Read the carrier from the policy-card line that contains
+    // "In Effect", rather than from the whole section heading.
+    const carrierLine = rawText
+        .split(/\r?\n/)
+        .map(normalizeText)
+        .find(line => /\bIn Effect\b/i.test(line));
+
+    const carrierMatch = carrierLine
+        ? carrierLine.match(/^(.+?)\s+In Effect\b/i)
+        : null;
 
     const biMatch = text.match(
         /\bBI\b[\s:]*\$?\s*([\d,]+)\s*\/\s*\$?\s*([\d,]+)/i
@@ -180,102 +201,101 @@ function findRatedDrivers() {
     const section = findRatedDriversSection();
     if (!section) return [];
 
-    const container = section.parentElement;
-    if (!container) return [];
+    // The Alta page lays each rated driver out in a separate vertical column.
+    // Include native selects and custom Angular/ARIA dropdown controls.
+    let container = section.parentElement;
+    for (let i = 0; i < 4 && container?.parentElement; i++) {
+        const text = normalizeText(container.innerText || '');
+        if (/First name/i.test(text) && /Date of birth/i.test(text)) break;
+        container = container.parentElement;
+    }
 
-    // Read visible inputs AND dropdowns.
-    const inputs = Array.from(
-        container.querySelectorAll('input, select')
-    )
-        .filter(isVisible)
-        .filter(input => {
-            const type = (input.type || '').toLowerCase();
-            return type !== 'hidden' &&
-                   type !== 'checkbox' &&
-                   type !== 'radio';
-        });
-
-    if (!inputs.length) return [];
+    const selector = 'input, select, textarea, [role="combobox"], [aria-haspopup="listbox"]';
+    const controls = Array.from(container.querySelectorAll(selector)).filter(el => {
+        if (!isVisible(el)) return false;
+        const type = (el.type || '').toLowerCase();
+        return !['hidden', 'checkbox', 'radio', 'button', 'submit'].includes(type);
+    });
 
     const columns = [];
+    for (const el of controls) {
+        const r = el.getBoundingClientRect();
+        let col = columns.find(c => Math.abs(c.x - r.left) < 45);
+        if (!col) { col = { x: r.left, items: [] }; columns.push(col); }
+        col.items.push({ el, top: r.top });
+    }
 
-    for (const input of inputs) {
-        const rect = input.getBoundingClientRect();
-        const x = Math.round(rect.left / 25) * 25;
-
-        let column = columns.find(c => Math.abs(c.x - x) <= 25);
-
-        if (!column) {
-            column = { x, inputs: [] };
-            columns.push(column);
+    function valueOf(el) {
+        if (!el) return '';
+        if (el.tagName === 'SELECT') {
+            return normalizeText(el.selectedOptions?.[0]?.textContent || el.value);
         }
-
-        column.inputs.push({
-            element: input,
-            top: rect.top
-        });
+        const direct = normalizeText(el.value || el.getAttribute('aria-valuetext') || el.innerText || el.textContent || '');
+        if (direct) return direct;
+        const labelled = el.getAttribute('aria-label') || el.getAttribute('title');
+        return normalizeText(labelled || '');
     }
 
     const drivers = [];
-
-    for (const column of columns) {
-        column.inputs.sort((a, b) => a.top - b.top);
-
-        const fields = column.inputs.map(item => item.element);
-
-        if (fields.length < 3) continue;
-
-        const firstName = normalizeText(fields[0].value);
-        const lastName = normalizeText(fields[1].value);
-        const dob = normalizeText(fields[2].value);
-
-        if (!firstName || !lastName || !dob) continue;
+    for (const col of columns) {
+        col.items.sort((a, b) => a.top - b.top);
+        const items = col.items;
+        const firstName = valueOf(items[0]?.el);
+        const lastName = valueOf(items[1]?.el);
+        const dob = valueOf(items[2]?.el);
+        if (!firstName || !lastName || !dob || !/\d/.test(dob)) continue;
         if (firstName.length > 50 || lastName.length > 50) continue;
-        if (!/\d/.test(dob)) continue;
 
-        // Dropdowns are ordered by their vertical position.
-        const selects = fields.filter(
-            field => field.tagName === 'SELECT'
-        );
+        // On Alta, after First name, Last name and DOB, the next four
+        // controls are Driver status, Gender, Relationship to PNI, Marital status.
+        const later = items.slice(3).map(item => ({ top: item.top, value: valueOf(item.el) })).filter(x => x.value);
+        const relationship = later.length >= 3 ? later[2].value : '';
+        const maritalStatus = later.length >= 4 ? later[3].value : '';
 
-        function selectedValue(select) {
-            if (!select) return '';
-
-            return normalizeText(
-                select.selectedOptions?.[0]?.textContent ||
-                select.value
-            );
-        }
-
-        // Driver status and Gender come before Relationship to PNI
-        // and Marital Status on the Alta driver form.
-        const relationship = selectedValue(selects[2]);
-        const maritalStatus = selectedValue(selects[3]);
-
-        drivers.push({
-            firstName,
-            lastName,
-            dob,
-            relationship,
-            maritalStatus
-        });
+        drivers.push({ firstName, lastName, dob, relationship, maritalStatus });
     }
 
-    // Remove duplicate driver records.
+    // Fallback: extract the visible dropdown text by the Alta row labels
+    // when custom dropdowns are not exposed as form controls.
+    if (drivers.some(d => !d.relationship || !d.maritalStatus)) {
+        const labels = Array.from(container.querySelectorAll('label, div, span'))
+            .filter(isVisible)
+            .filter(el => {
+                const t = normalizeText(el.textContent || '');
+                return t === 'Relationship to PNI' || t === 'Marital status';
+            });
+        for (const label of labels) {
+            const row = label.parentElement;
+            if (!row) continue;
+            const rowText = normalizeText(row.innerText || '');
+            const match = rowText.match(/Relationship to PNI\s*(Self|Spouse\/DP|Child|Other)/i) ||
+                          rowText.match(/Marital status\s*(Married|Single|Divorced|Widowed)/i);
+            if (!match) continue;
+            const val = normalizeText(match[1]);
+            const y = label.getBoundingClientRect().top;
+            for (const d of drivers) {
+                const idx = drivers.indexOf(d);
+                const col = columns[idx];
+                if (!col) continue;
+                const x = col.x;
+                const nearby = Array.from(row.querySelectorAll('*')).some(el => {
+                    const r = el.getBoundingClientRect();
+                    return Math.abs(r.left - x) < 80 && r.width > 20;
+                });
+                if (nearby) {
+                    if (/^Relationship/i.test(rowText)) d.relationship = val;
+                    else d.maritalStatus = val;
+                }
+            }
+        }
+    }
+
     const unique = [];
     const seen = new Set();
-
     for (const driver of drivers) {
-        const key = normalizeName(
-            `${driver.firstName} ${driver.lastName} ${driver.dob}`
-        );
-
-        if (seen.has(key)) continue;
-
-        seen.add(key);
-        unique.push(driver);
+        const key = normalizeName(`${driver.firstName} ${driver.lastName} ${driver.dob}`);
+        if (!seen.has(key)) { seen.add(key); unique.push(driver); }
     }
-
     return unique;
 }
 
@@ -336,7 +356,7 @@ function findRatedDrivers() {
                 position: fixed;
                 top: 90px;
                 right: 18px;
-                width: 350px;
+                width: 370px;
                 max-width: calc(100vw - 24px);
                 background: #fff;
                 color: #222;
@@ -357,7 +377,7 @@ function findRatedDrivers() {
                 align-items: center;
                 justify-content: space-between;
                 padding: 0 7px;
-                font-size: 11px;
+                font-size: 15px !important;
                 font-weight: bold;
                 cursor: grab;
                 touch-action: none;
@@ -384,12 +404,13 @@ function findRatedDrivers() {
 
             #alta-liability-content {
                 padding: 8px;
-                max-height: 230px;
-                overflow-y: auto;
+                max-height: none !important;
+                height: auto !important;
+                overflow: visible !important;
             }
 
             #alta-customer {
-                font-size: 10px;
+                font-size: 12px;
                 font-weight: bold;
                 color: #555;
                 margin-bottom: 3px;
@@ -399,10 +420,16 @@ function findRatedDrivers() {
             }
 
             #alta-carrier {
-                font-size: 10px;
-                font-weight: bold;
-                color: #333;
-                margin-bottom: 6px;
+                display: block;
+                box-sizing: border-box;
+                font-size: 20px !important;
+                font-weight: 800 !important;
+                color: #0757b7 !important;
+                background: #eaf3ff !important;
+                border-left: 4px solid #0757b7 !important;
+                border-radius: 4px;
+                padding: 5px 8px !important;
+                margin: 5px 0 8px !important;
                 white-space: nowrap;
                 overflow: hidden;
                 text-overflow: ellipsis;
@@ -421,7 +448,7 @@ function findRatedDrivers() {
                 display: flex;
                 align-items: center;
                 gap: 4px;
-                font-size: 11px;
+                font-size: 12px;
                 margin: 0;
                 white-space: nowrap;
             }
@@ -432,11 +459,11 @@ function findRatedDrivers() {
             #alta-pni-alert {
                 margin-top: 6px;
                 padding: 4px 6px;
-                background: #fff0d6;
-                border: 1px solid #e2a13b;
-                border-radius: 4px;
-                color: #8a4b00;
-                font-size: 10px;
+                background: #d90000 !important;
+                border: 2px solid #a80000 !important;
+                border-radius: 5px;
+                color: #ffffff !important;
+                font-size: 15px !important;
                 font-weight: bold;
                 text-align: center;
             }
@@ -444,7 +471,7 @@ function findRatedDrivers() {
             #alta-drivers-title {
                 margin-top: 7px;
                 margin-bottom: 4px;
-                font-size: 9px;
+                font-size: 10px;
                 font-weight: bold;
                 color: #555;
             }
@@ -461,7 +488,7 @@ function findRatedDrivers() {
                 background: #f5f7f8;
                 border: 1px solid #e5e8ea;
                 border-radius: 4px;
-                font-size: 10px;
+                font-size: 11px;
                 overflow-wrap: anywhere;
             }
 
@@ -472,14 +499,57 @@ function findRatedDrivers() {
 
             .alta-driver-detail {
                 color: #555;
-                line-height: 1.35;
+                font-size: 11px;
+                line-height: 1.4;
+            }
+
+            /* Force readable text sizes even if Alta page styles interfere. */
+            #${BOX_ID}, #${BOX_ID} * {
+                font-family: Arial, Helvetica, sans-serif !important;
+                font-size: 14px !important;
+                line-height: 1.35 !important;
+            }
+            #alta-liability-header { font-size: 15px !important; }
+            #alta-customer { font-size: 15px !important; }
+            #alta-carrier { font-size: 20px !important; color: #0757b7 !important; }
+            /* Slightly enlarge BI and PD labels and limits. */
+            #alta-policy-section {
+                gap: 16px !important;
+                padding: 7px 0 !important;
+            }
+            #alta-policy-section .alta-value {
+                font-size: 15px !important;
+                gap: 5px !important;
+            }
+            #alta-policy-section .alta-value span {
+                font-size: 14px !important;
+                font-weight: 700 !important;
+                color: #333 !important;
+            }
+            #alta-policy-section .alta-value strong {
+                font-size: 15px !important;
+                font-weight: 800 !important;
+                color: #111 !important;
+            }
+            #alta-drivers-title { font-size: 13px !important; }
+            .alta-driver-name { font-size: 14px !important; }
+            .alta-driver-detail { font-size: 13px !important; }
+            #alta-pni-alert {
+                display: none;
+                background: #d90000 !important;
+                color: #fff !important;
+                border: 2px solid #a80000 !important;
+                font-size: 16px !important;
+                font-weight: 900 !important;
+                padding: 7px !important;
+                text-align: center !important;
             }
 
             #alta-status {
                 margin-top: 6px;
                 padding-top: 5px;
                 border-top: 1px solid #e5e5e5;
-                font-size: 9px;
+                font-size: 10px;
                 color: #666;
             }
         `;
